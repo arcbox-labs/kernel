@@ -58,15 +58,17 @@ arcbox-kernel/
 
 ## Kernel Configuration
 
-Key configs for macOS Virtualization.framework compatibility:
+Key configs for macOS VM backends (VZ = Virtualization.framework, HV = Hypervisor.framework):
 
 ```
 # Required for VirtioFS on macOS
 CONFIG_VIRTIO_IOMMU=y
 
-# PL011 serial console (Virtualization.framework)
+# Serial console: PL011 (VZ backend) + 8250/16550 (HV backend)
 CONFIG_SERIAL_AMBA_PL011=y
 CONFIG_SERIAL_AMBA_PL011_CONSOLE=y
+CONFIG_SERIAL_8250=y
+CONFIG_SERIAL_8250_CONSOLE=y
 
 # GPIO support (Virtualization.framework)
 CONFIG_GPIOLIB=y
