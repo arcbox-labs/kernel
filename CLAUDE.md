@@ -58,7 +58,7 @@ arcbox-kernel/
 
 ## Kernel Configuration
 
-Key configs for macOS Virtualization.framework compatibility:
+Key configs for macOS VM backends (VZ = Virtualization.framework, HV = Hypervisor.framework):
 
 ```
 # Required for VirtioFS on macOS
