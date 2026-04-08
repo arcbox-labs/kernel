@@ -87,6 +87,11 @@ static const struct block_device_operations arcbox_fops = {
 static int arcbox_probe_one(int idx)
 {
 	struct arcbox_hvc_dev *dev = &devs[idx];
+	struct queue_limits lim = {
+		.logical_block_size = ARCBOX_HVC_SECTOR,
+		.physical_block_size = ARCBOX_HVC_SECTOR,
+		.max_hw_sectors = ARCBOX_HVC_MAX_SIZE / ARCBOX_HVC_SECTOR,
+	};
 	struct gendisk *disk;
 	int err;
 
@@ -103,16 +108,16 @@ static int arcbox_probe_one(int idx)
 	if (err)
 		return err;
 
-	disk = blk_mq_alloc_disk(&dev->tag_set, NULL, dev);
+	disk = blk_mq_alloc_disk(&dev->tag_set, &lim, dev);
 	if (IS_ERR(disk)) {
 		blk_mq_free_tag_set(&dev->tag_set);
 		return PTR_ERR(disk);
 	}
 
 	dev->disk = disk;
-	disk->major = 0;
-	disk->first_minor = idx * 16;
-	disk->minors = 16;
+	disk->major = 0;       /* Dynamic major allocation. */
+	disk->first_minor = 0; /* Dynamic major: minors must be 0. */
+	disk->minors = 0;
 	disk->fops = &arcbox_fops;
 	snprintf(disk->disk_name, DISK_NAME_LEN, "arcboxhvc%d", idx);
 
