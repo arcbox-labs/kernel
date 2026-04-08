@@ -1,0 +1,233 @@
+diff --git a/drivers/block/Kconfig b/drivers/block/Kconfig
+index 000000..111111 100644
+--- a/drivers/block/Kconfig
++++ b/drivers/block/Kconfig
+@@ -404,6 +404,16 @@ config VIRTIO_BLK
+ 	  This is the virtual block driver for virtio.  It can be used with
+           QEMU based VMMs (like KVM or Xen).  Say Y or M.
+
++config ARCBOX_HVC_BLK
++	bool "ArcBox HVC fast-path block device"
++	depends on ARM64
++	default n
++	help
++	  Paravirtualized block device that uses ARM HVC (Hypervisor Call)
++	  for small synchronous reads (≤4KB). Bypasses VirtIO queue overhead
++	  for metadata-heavy workloads (BoltDB, Btrfs B-tree). Only supported
++	  on ArcBox Hypervisor.framework VMs.
++
+ config BLK_DEV_RBD
+ 	tristate "Rados block device (RBD)"
+ 	depends on INET && BLOCK
+diff --git a/drivers/block/Makefile b/drivers/block/Makefile
+index 000000..111111 100644
+--- a/drivers/block/Makefile
++++ b/drivers/block/Makefile
+@@ -40,6 +40,7 @@ obj-$(CONFIG_BLK_DEV_UBLK)		+= ublk_drv.o
+
+ obj-$(CONFIG_XEN_BLKDEV_FRONTEND)	+= xen-blkfront.o
+ obj-$(CONFIG_VIRTIO_BLK)	+= virtio_blk.o
++obj-$(CONFIG_ARCBOX_HVC_BLK)	+= arcbox_hvc_blk.o
+ obj-$(CONFIG_BLK_DEV_SX8)	+= sx8.o
+ obj-$(CONFIG_BLK_DEV_RAM)	+= brd.o
+ obj-$(CONFIG_BLK_DEV_LOOP)	+= loop.o
+diff --git a/drivers/block/arcbox_hvc_blk.c b/drivers/block/arcbox_hvc_blk.c
+new file mode 100644
+index 000000..111111
+--- /dev/null
++++ b/drivers/block/arcbox_hvc_blk.c
+@@ -0,0 +1,196 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * ArcBox HVC fast-path block device driver.
++ *
++ * Provides a read-only block device backed by ARM HVC (Hypervisor Call)
++ * for low-latency metadata reads. Small reads (≤4KB) bypass the VirtIO
++ * queue path entirely — the HVC traps to the VMM which does a synchronous
++ * pread and returns the data directly in guest memory.
++ *
++ * This supplements (does not replace) the standard virtio-blk device.
++ * The guest can use this for latency-sensitive metadata access while
++ * virtio-blk handles bulk I/O.
++ *
++ * SMCCC function IDs (vendor-specific range):
++ *   0xC2000000  ARCBOX_HVC_PROBE    — returns number of block devices
++ *   0xC2000001  ARCBOX_HVC_BLK_READ — synchronous block read
++ */
++
++#include <linux/module.h>
++#include <linux/blk-mq.h>
++#include <linux/blkdev.h>
++#include <linux/genhd.h>
++#include <linux/arm-smccc.h>
++#include <linux/of.h>
++
++#define ARCBOX_HVC_PROBE      0xC2000000
++#define ARCBOX_HVC_BLK_READ   0xC2000001
++#define ARCBOX_HVC_MAX_SIZE   4096
++#define ARCBOX_HVC_SECTOR_SIZE 512
++
++#define DRIVER_NAME "arcbox_hvc_blk"
++
++struct arcbox_hvc_blk_dev {
++	struct gendisk *disk;
++	struct blk_mq_tag_set tag_set;
++	unsigned int device_idx;
++	sector_t capacity; /* in 512-byte sectors */
++};
++
++static int arcbox_hvc_blk_num_devices;
++static struct arcbox_hvc_blk_dev *arcbox_hvc_blk_devs;
++
++/* Issue HVC to read data directly into a page-aligned buffer. */
++static int arcbox_hvc_read(unsigned int dev_idx, sector_t sector,
++			   void *buf, unsigned int len)
++{
++	struct arm_smccc_res res;
++	phys_addr_t gpa = virt_to_phys(buf);
++
++	if (len > ARCBOX_HVC_MAX_SIZE)
++		return -EINVAL;
++
++	arm_smccc_1_1_hvc(ARCBOX_HVC_BLK_READ,
++			  dev_idx, sector, gpa, len,
++			  0, 0, 0, &res);
++
++	if ((long)res.a0 < 0)
++		return (int)(long)res.a0;
++	return (int)res.a0;
++}
++
++/* blk-mq request handler. */
++static blk_status_t arcbox_hvc_queue_rq(struct blk_mq_hw_ctx *hctx,
++					const struct blk_mq_queue_data *bd)
++{
++	struct request *rq = bd->rq;
++	struct arcbox_hvc_blk_dev *dev = rq->q->queuedata;
++	struct bio_vec bvec;
++	struct req_iterator iter;
++	sector_t sector = blk_rq_pos(rq);
++	int ret;
++
++	blk_mq_start_request(rq);
++
++	/* Only handle reads ≤ 4KB. Reject everything else. */
++	if (req_op(rq) != REQ_OP_READ || blk_rq_bytes(rq) > ARCBOX_HVC_MAX_SIZE) {
++		blk_mq_end_request(rq, BLK_STS_NOTSUPP);
++		return BLK_STS_OK;
++	}
++
++	rq_for_each_segment(bvec, rq, iter) {
++		void *buf = page_address(bvec.bv_page) + bvec.bv_offset;
++		unsigned int len = bvec.bv_len;
++
++		ret = arcbox_hvc_read(dev->device_idx, sector, buf, len);
++		if (ret < 0) {
++			blk_mq_end_request(rq, BLK_STS_IOERR);
++			return BLK_STS_OK;
++		}
++		sector += len / ARCBOX_HVC_SECTOR_SIZE;
++	}
++
++	blk_mq_end_request(rq, BLK_STS_OK);
++	return BLK_STS_OK;
++}
++
++static const struct blk_mq_ops arcbox_hvc_mq_ops = {
++	.queue_rq = arcbox_hvc_queue_rq,
++};
++
++static int arcbox_hvc_blk_probe_one(unsigned int idx)
++{
++	struct arcbox_hvc_blk_dev *dev = &arcbox_hvc_blk_devs[idx];
++	struct gendisk *disk;
++	int err;
++
++	dev->device_idx = idx;
++
++	/* Read capacity from the first sector — VMM exposes it via pread.
++	 * For now, set a large default (the VMM handles out-of-range reads). */
++	dev->capacity = (sector_t)1 << 30; /* 512 GB default */
++
++	memset(&dev->tag_set, 0, sizeof(dev->tag_set));
++	dev->tag_set.ops = &arcbox_hvc_mq_ops;
++	dev->tag_set.nr_hw_queues = 1;
++	dev->tag_set.queue_depth = 32;
++	dev->tag_set.numa_node = NUMA_NO_NODE;
++	dev->tag_set.cmd_size = 0;
++	dev->tag_set.flags = BLK_MQ_F_SHOULD_MERGE;
++
++	err = blk_mq_alloc_tag_set(&dev->tag_set);
++	if (err)
++		return err;
++
++	disk = blk_mq_alloc_disk(&dev->tag_set, NULL, dev);
++	if (IS_ERR(disk)) {
++		blk_mq_free_tag_set(&dev->tag_set);
++		return PTR_ERR(disk);
++	}
++
++	dev->disk = disk;
++	disk->major = 0; /* dynamic major */
++	disk->first_minor = idx * 16;
++	disk->minors = 16;
++	disk->fops = &(const struct block_device_operations) {
++		.owner = THIS_MODULE,
++	};
++	snprintf(disk->disk_name, DISK_NAME_LEN, "arcboxhvc%u", idx);
++	set_capacity(disk, dev->capacity);
++
++	/* Read-only device — HVC fast path is for reads only. */
++	set_disk_ro(disk, 1);
++
++	/* Physical/logical sector size. */
++	blk_queue_physical_block_size(disk->queue, ARCBOX_HVC_SECTOR_SIZE);
++	blk_queue_logical_block_size(disk->queue, ARCBOX_HVC_SECTOR_SIZE);
++	blk_queue_max_hw_sectors(disk->queue, ARCBOX_HVC_MAX_SIZE / ARCBOX_HVC_SECTOR_SIZE);
++
++	err = add_disk(disk);
++	if (err) {
++		put_disk(disk);
++		blk_mq_free_tag_set(&dev->tag_set);
++		return err;
++	}
++
++	pr_info(DRIVER_NAME ": registered /dev/%s (device_idx=%u)\n",
++		disk->disk_name, idx);
++	return 0;
++}
++
++static int __init arcbox_hvc_blk_init(void)
++{
++	struct arm_smccc_res res;
++	int i, err;
++
++	/* Probe VMM for number of block devices. */
++	arm_smccc_1_1_hvc(ARCBOX_HVC_PROBE, 0, 0, 0, 0, 0, 0, 0, &res);
++	arcbox_hvc_blk_num_devices = (int)res.a0;
++
++	if (arcbox_hvc_blk_num_devices <= 0) {
++		pr_info(DRIVER_NAME ": no devices (VMM returned %d)\n",
++			arcbox_hvc_blk_num_devices);
++		return -ENODEV;
++	}
++
++	pr_info(DRIVER_NAME ": probed %d device(s)\n",
++		arcbox_hvc_blk_num_devices);
++
++	arcbox_hvc_blk_devs = kcalloc(arcbox_hvc_blk_num_devices,
++				      sizeof(*arcbox_hvc_blk_devs),
++				      GFP_KERNEL);
++	if (!arcbox_hvc_blk_devs)
++		return -ENOMEM;
++
++	for (i = 0; i < arcbox_hvc_blk_num_devices; i++) {
++		err = arcbox_hvc_blk_probe_one(i);
++		if (err)
++			pr_warn(DRIVER_NAME ": failed to probe device %d: %d\n",
++				i, err);
++	}
++
++	return 0;
++}
++builtin_platform_driver_probe(arcbox_hvc_blk_init);

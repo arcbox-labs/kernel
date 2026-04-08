@@ -92,6 +92,11 @@ tar -xJf linux-$KERNEL_VERSION.tar.xz
 rm linux-$KERNEL_VERSION.tar.xz
 cd linux-$KERNEL_VERSION
 
+# Apply ArcBox patches (custom drivers, etc.)
+for patchfile in /workspace/patches/*.patch; do
+    [ -f "\$patchfile" ] && echo "Applying patch: \$patchfile" && patch -p1 < "\$patchfile" || true
+done
+
 # Copy config
 cp /workspace/configs/arcbox-$TARGET_ARCH.config .config
 
@@ -122,6 +127,11 @@ else
     tar -xJf "linux-$KERNEL_VERSION.tar.xz"
     rm "linux-$KERNEL_VERSION.tar.xz"
     cd "linux-$KERNEL_VERSION"
+
+    # Apply ArcBox patches
+    for patchfile in "$PROJECT_DIR"/patches/*.patch; do
+        [ -f "$patchfile" ] && echo "Applying patch: $patchfile" && patch -p1 < "$patchfile" || true
+    done
 
     # Copy config
     cp "$CONFIG_FILE" .config
