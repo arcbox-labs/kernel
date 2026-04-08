@@ -52,49 +52,13 @@ jobs:
           curl -sL "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-${{ env.KERNEL_VERSION }}.tar.xz" \
             | tar -xJ
 
-      - name: Install ArcBox custom drivers
-        run: |
-          cd "linux-${{ env.KERNEL_VERSION }}"
-          # Copy driver source files into kernel tree.
-          for src in ../drivers/*.c; do
-            [ -f "$src" ] || continue
-            name=$(basename "$src")
-            cp "$src" "drivers/block/$name"
-            obj_name="${name%.c}.o"
-            config_name="CONFIG_$(echo "${name%.c}" | tr 'a-z' 'A-Z')"
-            # Append to Makefile if not already present.
-            if ! grep -q "$obj_name" drivers/block/Makefile; then
-              echo "obj-\$($config_name)	+= $obj_name" >> drivers/block/Makefile
-              echo "Injected $obj_name into drivers/block/Makefile"
-            fi
-            # Append Kconfig entry if not already present.
-            if ! grep -q "$config_name" drivers/block/Kconfig; then
-              cat >> drivers/block/Kconfig <<KCONFIG
-
-          config ${config_name#CONFIG_}
-          	bool "ArcBox ${name%.c} driver"
-          	depends on ARM64 && ARM_SMCCC
-          	default n
-          	help
-          	  ArcBox custom driver: $name
-          KCONFIG
-              echo "Injected $config_name into drivers/block/Kconfig"
-            fi
-          done
-
       - name: Build kernel
         run: |
-          cd "linux-${{ env.KERNEL_VERSION }}"
-          cp "../configs/arcbox-${{ matrix.arch }}.config" .config
-          make olddefconfig
-          make -j"$(nproc)"
-
-          mkdir -p ../output
-          if [ "${{ matrix.arch }}" = "arm64" ]; then
-            cp arch/arm64/boot/Image "../output/kernel-${{ matrix.arch }}"
-          else
-            cp arch/x86/boot/bzImage "../output/kernel-${{ matrix.arch }}"
-          fi
+          USE_DOCKER=0 \
+          ARCH=${{ matrix.arch }} \
+          KERNEL_VERSION=${{ env.KERNEL_VERSION }} \
+          OUTPUT_DIR="$(pwd)/output" \
+          ./scripts/build-kernel.sh
 
       - name: Generate checksum
         run: |

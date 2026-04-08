@@ -133,6 +133,31 @@ else
         [ -f "$patchfile" ] && echo "Applying patch: $patchfile" && patch -p1 < "$patchfile" || true
     done
 
+    # Install ArcBox custom drivers into kernel tree
+    for src in "$PROJECT_DIR"/drivers/*.c; do
+        [ -f "$src" ] || continue
+        name=$(basename "$src")
+        cp "$src" "drivers/block/$name"
+        obj_name="${name%.c}.o"
+        config_name="CONFIG_$(echo "${name%.c}" | tr 'a-z' 'A-Z')"
+        if ! grep -q "$obj_name" drivers/block/Makefile; then
+            echo "obj-\$($config_name)	+= $obj_name" >> drivers/block/Makefile
+            echo "Injected $obj_name into drivers/block/Makefile"
+        fi
+        if ! grep -q "$config_name" drivers/block/Kconfig; then
+            cat >> drivers/block/Kconfig <<KCONFIG
+
+config ${config_name#CONFIG_}
+	bool "ArcBox ${name%.c} driver"
+	depends on ARM64 && ARM_SMCCC
+	default n
+	help
+	  ArcBox custom driver: $name
+KCONFIG
+            echo "Injected $config_name into drivers/block/Kconfig"
+        fi
+    done
+
     # Copy config
     cp "$CONFIG_FILE" .config
 
