@@ -120,10 +120,7 @@ static int arcbox_probe_one(int idx)
 	set_capacity(disk, (sector_t)1 << 30);
 	set_disk_ro(disk, 1);
 
-	blk_queue_physical_block_size(disk->queue, ARCBOX_HVC_SECTOR);
-	blk_queue_logical_block_size(disk->queue, ARCBOX_HVC_SECTOR);
-	blk_queue_max_hw_sectors(disk->queue,
-				 ARCBOX_HVC_MAX_SIZE / ARCBOX_HVC_SECTOR);
+	/* Block size and max sectors configured via queue_limits above. */
 
 	err = add_disk(disk);
 	if (err) {
@@ -145,9 +142,9 @@ static int __init arcbox_hvc_blk_init(void)
 	num_devices = (int)res.a0;
 
 	if (num_devices <= 0) {
-		pr_info(DRIVER_NAME ": no devices (probe returned %d)\n",
+		pr_info(DRIVER_NAME ": no devices (probe returned %d), skipping\n",
 			num_devices);
-		return -ENODEV;
+		return 0; /* Not fatal for built-in driver. */
 	}
 	if (num_devices > MAX_DEVICES)
 		num_devices = MAX_DEVICES;

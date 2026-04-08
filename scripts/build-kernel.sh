@@ -49,7 +49,39 @@ fi
 # Create output directory
 mkdir -p "$OUTPUT_DIR"
 
+# ============================================================================
+# Common build logic (called from both Docker and native paths)
+# ============================================================================
+# Expects:
+#   - CWD = extracted kernel source root (linux-$KERNEL_VERSION)
+#   - $ARCBOX_SRC = path to arcbox-kernel repo
+#   - $TARGET_ARCH, $KERNEL_IMAGE, $CROSS_COMPILE set
+#   - $OUTPUT_PATH = where to copy the final kernel binary
+do_build() {
+    local ARCBOX_SRC="$1"
+    local OUTPUT_PATH="$2"
+
+    # Inject custom drivers and patches.
+    sh "$ARCBOX_SRC/scripts/inject-drivers.sh" "$ARCBOX_SRC"
+
+    # Copy config and update for this kernel version.
+    cp "$ARCBOX_SRC/configs/arcbox-$TARGET_ARCH.config" .config
+    make ARCH=$TARGET_ARCH ${CROSS_COMPILE:+CROSS_COMPILE=$CROSS_COMPILE} olddefconfig
+
+    # Build.
+    echo "Building kernel..."
+    make ARCH=$TARGET_ARCH ${CROSS_COMPILE:+CROSS_COMPILE=$CROSS_COMPILE} -j"$(nproc)" $KERNEL_IMAGE
+
+    # Copy output.
+    cp "arch/$TARGET_ARCH/boot/$KERNEL_IMAGE" "$OUTPUT_PATH"
+    echo ""
+    echo "Build complete!"
+    ls -lh "$OUTPUT_PATH"
+}
+
+# ============================================================================
 # Check if running in Docker or need to use Docker
+# ============================================================================
 if [ -f /.dockerenv ] || [ "${USE_DOCKER:-}" = "0" ]; then
     echo "Building natively..."
     BUILD_IN_DOCKER=0
@@ -59,119 +91,42 @@ else
 fi
 
 if [ "$BUILD_IN_DOCKER" = "1" ]; then
-    # Build using Docker
     docker run --rm \
         -v "$PROJECT_DIR:/workspace" \
         -v "$OUTPUT_DIR:/output" \
         -w /build \
-        --platform linux/$TARGET_ARCH \
+        --platform "linux/$TARGET_ARCH" \
         "${DOCKER_IMAGE:-alpine:latest}" \
         sh -c "
 set -e
-
-# Install build dependencies
-apk add --no-cache \
-    build-base \
-    bc \
-    bison \
-    flex \
-    openssl-dev \
-    elfutils-dev \
-    perl \
-    curl \
-    xz \
-    cpio \
-    linux-headers \
-    ncurses-dev
-
-# Download kernel source
+apk add --no-cache build-base bc bison flex openssl-dev elfutils-dev perl curl xz cpio linux-headers ncurses-dev
 echo 'Downloading Linux kernel $KERNEL_VERSION...'
-curl -L -o linux-$KERNEL_VERSION.tar.xz https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-$KERNEL_VERSION.tar.xz
-echo 'Extracting...'
-tar -xJf linux-$KERNEL_VERSION.tar.xz
-rm linux-$KERNEL_VERSION.tar.xz
+curl -L -o linux.tar.xz https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-$KERNEL_VERSION.tar.xz
+tar -xJf linux.tar.xz && rm linux.tar.xz
 cd linux-$KERNEL_VERSION
-
-# Apply ArcBox patches (custom drivers, etc.)
-for patchfile in /workspace/patches/*.patch; do
-    [ -f "\$patchfile" ] && echo "Applying patch: \$patchfile" && patch -p1 < "\$patchfile" || true
-done
-
-# Copy config
+sh /workspace/scripts/inject-drivers.sh /workspace
 cp /workspace/configs/arcbox-$TARGET_ARCH.config .config
-
-# Update config to match kernel version
 make ARCH=$TARGET_ARCH olddefconfig
-
-# Build kernel
 echo 'Building kernel...'
 make ARCH=$TARGET_ARCH -j\$(nproc) $KERNEL_IMAGE
-
-# Copy output
 cp arch/$TARGET_ARCH/boot/$KERNEL_IMAGE /output/kernel-$TARGET_ARCH
-
-echo ''
 echo 'Build complete!'
 ls -lh /output/kernel-$TARGET_ARCH
 "
 else
-    # Native build (for CI or when already in container)
     BUILD_DIR="/tmp/arcbox-kernel-build-$$"
     mkdir -p "$BUILD_DIR"
     cd "$BUILD_DIR"
 
-    # Download kernel
     echo "Downloading Linux kernel $KERNEL_VERSION..."
-    curl -L -o "linux-$KERNEL_VERSION.tar.xz" "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-$KERNEL_VERSION.tar.xz"
+    curl -L -o "linux.tar.xz" "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-$KERNEL_VERSION.tar.xz"
     echo "Extracting..."
-    tar -xJf "linux-$KERNEL_VERSION.tar.xz"
-    rm "linux-$KERNEL_VERSION.tar.xz"
+    tar -xJf "linux.tar.xz"
+    rm "linux.tar.xz"
     cd "linux-$KERNEL_VERSION"
 
-    # Apply ArcBox patches
-    for patchfile in "$PROJECT_DIR"/patches/*.patch; do
-        [ -f "$patchfile" ] && echo "Applying patch: $patchfile" && patch -p1 < "$patchfile" || true
-    done
+    do_build "$PROJECT_DIR" "$OUTPUT_DIR/kernel-$TARGET_ARCH"
 
-    # Install ArcBox custom drivers into kernel tree
-    for src in "$PROJECT_DIR"/drivers/*.c; do
-        [ -f "$src" ] || continue
-        name=$(basename "$src")
-        cp "$src" "drivers/block/$name"
-        obj_name="${name%.c}.o"
-        config_name="CONFIG_$(echo "${name%.c}" | tr 'a-z' 'A-Z')"
-        if ! grep -q "$obj_name" drivers/block/Makefile; then
-            echo "obj-\$($config_name)	+= $obj_name" >> drivers/block/Makefile
-            echo "Injected $obj_name into drivers/block/Makefile"
-        fi
-        if ! grep -q "$config_name" drivers/block/Kconfig; then
-            cat >> drivers/block/Kconfig <<KCONFIG
-
-config ${config_name#CONFIG_}
-	bool "ArcBox ${name%.c} driver"
-	depends on ARM64 && ARM_SMCCC
-	default n
-	help
-	  ArcBox custom driver: $name
-KCONFIG
-            echo "Injected $config_name into drivers/block/Kconfig"
-        fi
-    done
-
-    # Copy config
-    cp "$CONFIG_FILE" .config
-
-    # Update config
-    make ARCH=$TARGET_ARCH CROSS_COMPILE=$CROSS_COMPILE olddefconfig
-
-    # Build
-    echo "Building kernel..."
-    make ARCH=$TARGET_ARCH CROSS_COMPILE=$CROSS_COMPILE -j$(nproc) $KERNEL_IMAGE
-
-    # Copy output
-    cp "arch/$TARGET_ARCH/boot/$KERNEL_IMAGE" "$OUTPUT_DIR/kernel-$TARGET_ARCH"
-
-    # Cleanup
     rm -rf "$BUILD_DIR"
 fi
 
