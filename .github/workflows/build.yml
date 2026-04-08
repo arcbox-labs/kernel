@@ -117,3 +117,11 @@ jobs:
           files: release/*
           draft: false
           prerelease: ${{ contains(github.ref_name, 'alpha') || contains(github.ref_name, 'beta') }}
+
+      - name: Trigger boot-assets rebuild
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.BOOT_ASSETS_DISPATCH_TOKEN }}
+          repository: arcboxlabs/boot-assets
+          event-type: kernel-release
+          client-payload: '{"kernel_tag": "${{ github.ref_name }}"}'
