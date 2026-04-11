@@ -6,11 +6,18 @@ set -e
 
 ARCBOX_DIR="${1:-.}"
 
-# Apply patches
+# Apply .patch files (unified diffs).
 for patchfile in "$ARCBOX_DIR"/patches/*.patch; do
     [ -f "$patchfile" ] || continue
     echo "Applying patch: $patchfile"
     patch -p1 < "$patchfile" || true
+done
+
+# Run .sh patch scripts (for complex patches that need sed).
+for script in "$ARCBOX_DIR"/patches/*.sh; do
+    [ -f "$script" ] || continue
+    echo "Running patch script: $script"
+    sh "$script"
 done
 
 # Copy driver source files and inject Kconfig/Makefile entries
